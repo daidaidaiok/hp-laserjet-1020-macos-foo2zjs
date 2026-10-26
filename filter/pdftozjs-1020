@@ -1,0 +1,88 @@
+#!/bin/sh
+#
+# CUPS filter for the HP LaserJet 1020 (host-based ZjStream printer).
+#
+#   PDF --gs--> pbmraw --foo2zjs--> ZjStream
+#
+# The 1020 keeps its firmware in volatile memory. Before each job we ask the
+# usb backend for the 1284 device ID over the CUPS side channel; if FWVER is
+# missing, the firmware is sent first.
+#
+# Usage (called by cupsd): pdftozjs-1020 job user title copies options [file]
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+BASE=/Library/Printers/foo2zjs
+# Private Ghostscript copy: the cupsd sandbox won't exec /usr/local/bin/gs.
+GS=$BASE/bin/gs
+GSRES=$BASE/share/ghostscript
+GS_LIB=$GSRES/Resource/Init:$GSRES/lib:$GSRES/Resource/Font
+export GS_LIB
+FOO2ZJS=$BASE/bin/foo2zjs
+SCDEVID=$BASE/bin/sc-deviceid
+FIRMWARE=$BASE/firmware/sihp1020.dl
+FW_SETTLE=8	# seconds for the printer to boot freshly loaded firmware
+
+log() { echo "$1: pdftozjs-1020: $2" >&2; }
+
+if [ $# -lt 5 ] || [ $# -gt 6 ]; then
+    echo "Usage: $0 job user title copies options [file]" >&2
+    exit 1
+fi
+
+JOB=$1; USERNAME=$2; TITLE=$3; COPIES=$4; OPTIONS=$5
+INPUT=${6:--}
+
+# Page size from the job options (media=, PageSize=); default A4.
+PAGE=A4
+for opt in $OPTIONS; do
+    case "$opt" in
+    PageSize=*|media=*|PageRegion=*) PAGE=${opt#*=}; PAGE=${PAGE%%,*};;
+    esac
+done
+
+# Dimensions at 600x600 dpi and foo2zjs paper codes, per foo2zjs-wrapper.
+case "$PAGE" in
+[Ll]etter)	PAPER=1;  DIM=5100x6600;;
+[Ll]egal)	PAPER=5;  DIM=5100x8400;;
+[Ee]xecutive)	PAPER=7;  DIM=4350x6300;;
+A5|a5)		PAPER=11; DIM=3496x4960;;
+B5|b5)		PAPER=13; DIM=4299x6070;;
+*)		PAGE=A4; PAPER=9; DIM=4960x7016;;
+esac
+
+# Firmware check. If the side channel fails we can't tell, so send it anyway:
+# a redundant upload only costs a few seconds, a missing one loses the job.
+DEVID=$("$SCDEVID" 2>/dev/null)
+case "$DEVID" in
+*FWVER:*)
+    log DEBUG "firmware present (${DEVID##*FWVER:})"
+    ;;
+*)
+    if [ -n "$DEVID" ]; then
+        log INFO "firmware not loaded, uploading $FIRMWARE"
+    else
+        log INFO "device ID unavailable, uploading $FIRMWARE to be safe"
+    fi
+    echo "STATE: +connecting-to-device" >&2
+    cat "$FIRMWARE" || { log ERROR "cannot read $FIRMWARE"; exit 1; }
+    sleep "$FW_SETTLE"
+    echo "STATE: -connecting-to-device" >&2
+    ;;
+esac
+
+log DEBUG "page=$PAGE paper=$PAPER dim=$DIM copies=$COPIES"
+
+# fd 3 dance (from foo2zjs-wrapper): keeps any gs chatter on stdout out of the
+# raster stream.
+("$GS" -q -dBATCH -dSAFER -dQUIET -dNOPAUSE \
+    -sGenericResourceDir="$GSRES/Resource/" -sFontResourceDir="$GSRES/Resource/Font/" \
+    -sPAPERSIZE="$(echo "$PAGE" | tr 'A-Z' 'a-z')" -dFIXEDMEDIA -dPDFFitPage \
+    -g"$DIM" -r600x600 -sDEVICE=pbmraw \
+    -sOutputFile="|cat 1>&3" "$INPUT" >/dev/null) 3>&1 \
+| "$FOO2ZJS" -r600x600 -g"$DIM" -p"$PAPER" -n"$COPIES" -z1 -P -L0 \
+    -u 96x96 -l 96x96 -J "$TITLE" -U "$USERNAME"
+
+status=$?
+[ $status -ne 0 ] && log ERROR "foo2zjs pipeline failed ($status)"
+exit $status
